@@ -10,13 +10,26 @@ groups:
         annotations:
           summary: "{{ $labels.instance }} is unreachable (node_exporter down for 2m+)"
 
-      - alert: HighDiskUsage
-        expr: (1 - (node_filesystem_avail_bytes{mountpoint="/",fstype!="rootfs"} / node_filesystem_size_bytes{mountpoint="/",fstype!="rootfs"})) * 100 > 90
-        for: 5m
+      - alert: DiskSpaceWarning
+        # Early heads up, not the emergency: gh-runner previously hit 98.1%
+        # (docs/19-devops-practice/14) before anyone noticed, purely because
+        # the only rule that existed fired late, at 90%. This one exists to
+        # give enough runway to actually clear space before DiskSpaceCritical
+        # below ever needs to fire.
+        expr: (1 - (node_filesystem_avail_bytes{mountpoint="/",fstype!="rootfs"} / node_filesystem_size_bytes{mountpoint="/",fstype!="rootfs"})) * 100 > 80
+        for: 15m
         labels:
           severity: warning
         annotations:
-          summary: "{{ $labels.instance }} root filesystem is above 90% full"
+          summary: "{{ $labels.instance }} root filesystem is above 80% full, trending toward full"
+
+      - alert: DiskSpaceCritical
+        expr: (1 - (node_filesystem_avail_bytes{mountpoint="/",fstype!="rootfs"} / node_filesystem_size_bytes{mountpoint="/",fstype!="rootfs"})) * 100 > 95
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "{{ $labels.instance }} root filesystem is above 95% full, act now"
 
       - alert: PodCrashLooping
         # Not kube_pod_container_status_waiting_reason{reason="CrashLoopBackOff"}
