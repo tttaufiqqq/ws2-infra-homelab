@@ -1,3 +1,5 @@
+# EXAMPLE ONLY - not wired up. The homelab this ran against no longer exists, so this file lives
+# under docs/ and not .github/workflows/, where it would be scheduled and fail. See docs/architecture.md.
 name: Terraform Drift Check
 
 # Read-only visibility into whether real Proxmox infrastructure has drifted
