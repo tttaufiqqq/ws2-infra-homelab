@@ -1,4 +1,4 @@
-# ws2-infra
+# ws2-infra-homelab
 
 Infrastructure for the Animal Shelter Workshop (Workshop II, UTeM) app, split out of
 [`Animal-Shelter-Workshop`](https://github.com/tttaufiqqq/Animal-Shelter-Workshop).
