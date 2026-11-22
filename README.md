@@ -35,7 +35,8 @@ The full topology, with a diagram, is in [Architecture](docs/architecture.md).
 | `infrastructure/*.sh`, `*.py` | A disposable test-loop that creates and destroys scratch machines |
 | `k8s/` | The app, nginx, Redis, a Cloudflare Tunnel, and monitoring agents for k3s |
 | `docs/` | Architecture, rebuild order, implementation log, troubleshooting, and the original reference write-ups |
-| `docs/examples/` | A daily Terraform drift-check workflow, kept as an example only |
+| `app-build/` | The Dockerfile, compose file, and nginx/PHP config that built the app image (moved from the app repo) |
+| `docs/examples/` | The Terraform drift check and the app repo's CI workflow, kept as examples only |
 
 ### Limitations
 

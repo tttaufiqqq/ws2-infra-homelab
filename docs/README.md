@@ -17,10 +17,13 @@ These were written alongside the build, in the application repository, and moved
 - [Terraform](07-terraform.md): one-time prerequisites, the test loop versus the real fleet, and lessons from importing live machines.
 - [Production hardening](09-production-hardening.md): deploy safety, TLS, Vault secrets and the known follow-ups.
 - [Backups](10-backups.md): coordinated cross-database backups, retention, the restore drill and alerting.
+- [CI](11-ci.md): the self-hosted GitHub Actions runner, why it was self-hosted, and a real upstream Action bug found running it.
+- [CD](12-cd.md): automatic deploy on green tests, path-based routing and the rollback design.
 
 ## Other folders
 
-- [`examples/`](examples/): the daily Terraform drift-check workflow, kept as an example only.
+- [`examples/`](examples/): the Terraform drift check and the app repo's CI workflow, kept as examples only.
+- [`../app-build/`](../app-build/): the Dockerfile, nginx and PHP config and compose file that built the app image.
 - [`images/`](images/): diagrams used by these pages.
 
 Start at the [repository README](../README.md) if you haven't already. It covers the same ground in less detail.

@@ -1,0 +1,156 @@
+# EXAMPLE ONLY - not wired up. This was the app repo's CI workflow; it needed the homelab's self-hosted runner
+# and Tailscale-only databases, which no longer exist. Kept for reference. See docs/11-ci.md.
+name: Tests
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - "**.md"
+      - "docs/**"
+  pull_request:
+    branches: [main]
+    paths-ignore:
+      - "**.md"
+      - "docs/**"
+
+# The 5 databases this resets are real, shared MariaDB/MySQL/PostgreSQL
+# servers, not per-run containers — two runs resetting them at once would
+# stomp on each other. Queue instead of running in parallel (don't cancel
+# an in-progress reset, that'd leave tables half-dropped).
+concurrency:
+  group: tests-shared-db
+  cancel-in-progress: false
+
+jobs:
+  backend:
+    runs-on: [self-hosted, linux, homelab, tailnet]
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # shivammathur/setup-php@v2 has a path-construction bug (n.replace(e, "run") does a
+      # naive string replace of the FIRST match of the platform name "linux" anywhere in
+      # the full extracted path, not just the trailing linux.sh filename) that this runner
+      # triggers because its own hostname, linux-gh-runner, contains "linux" earlier in the
+      # path than the filename does — corrupting it to .../home/run-gh-runner/... and
+      # failing with ENOENT on every run. Installing PHP via apt (Ubuntu 24.04 ships 8.3
+      # natively, matching ws2-infra-homelab/infrastructure/ansible/playbooks/app-server.yml's production
+      # install) sidesteps the third-party action entirely.
+      # php8.3-sqlite3 (pdo_sqlite) isn't for app data - every model/migration pins one of
+      # the 5 real connections (docs/03-db-architecture.md) - it's for Laravel's own migration
+      # *repository* bookkeeping, which always runs against config('database.default') no
+      # matter which connection an individual migration targets. .env.testing.example points
+      # that default at local sqlite specifically so it never touches a real Tailscale DB.
+      # php8.3-gd is for tests that generate fake upload images
+      # (Illuminate\Http\Testing\FileFactory::image(), used by animal/report photo tests).
+      - name: Install PHP 8.3 and required extensions
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y php8.3-cli php8.3-mbstring php8.3-bcmath php8.3-curl \
+            php8.3-xml php8.3-zip php8.3-mysql php8.3-pgsql php8.3-sqlite3 php8.3-gd
+
+      - name: Install Composer
+        run: |
+          command -v composer >/dev/null 2>&1 && exit 0
+          curl -sS https://getcomposer.org/installer | php
+          sudo mv composer.phar /usr/local/bin/composer
+          sudo chmod +x /usr/local/bin/composer
+
+      - name: Install Composer dependencies
+        run: composer install --no-interaction --prefer-dist --optimize-autoloader
+
+      # database/testing.sqlite is gitignored (it's a local artifact, not app data - see the
+      # pdo_sqlite comment above) so a fresh checkout never has it; the sqlite driver needs
+      # the file to actually exist, not just the extension.
+      - name: Configure test environment
+        run: |
+          cp .env.testing.example .env.testing
+          mkdir -p database
+          touch database/testing.sqlite
+
+      # migrate:fresh (Laravel's built-in) only drops tables on the default
+      # connection (sqlite) — this app's migrations pin to 5 named
+      # connections instead, so that command would silently not reset them.
+      # db:fresh-all (app/Console/Commands/FreshAllDatabases.php) is the
+      # app's own command that resets all 5 correctly; --force skips its
+      # interactive confirmation prompt for CI.
+      - name: Reset the 5 distributed test databases
+        run: php artisan db:fresh-all --env=testing --force
+
+      - name: Run backend test suite
+        run: php artisan test --env=testing --testsuite=Unit,Feature,Procedures
+
+  # Separate job, forced to run after `backend` (`needs:`) — this CT has a
+  # single core, so two artisan/npm processes at once would just contend for
+  # the same CPU, not actually run faster.
+  browser:
+    needs: backend
+    runs-on: [self-hosted, linux, homelab, tailnet]
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # shivammathur/setup-php@v2 has a path-construction bug (n.replace(e, "run") does a
+      # naive string replace of the FIRST match of the platform name "linux" anywhere in
+      # the full extracted path, not just the trailing linux.sh filename) that this runner
+      # triggers because its own hostname, linux-gh-runner, contains "linux" earlier in the
+      # path than the filename does — corrupting it to .../home/run-gh-runner/... and
+      # failing with ENOENT on every run. Installing PHP via apt (Ubuntu 24.04 ships 8.3
+      # natively, matching ws2-infra-homelab/infrastructure/ansible/playbooks/app-server.yml's production
+      # install) sidesteps the third-party action entirely.
+      # php8.3-sqlite3 (pdo_sqlite) isn't for app data - every model/migration pins one of
+      # the 5 real connections (docs/03-db-architecture.md) - it's for Laravel's own migration
+      # *repository* bookkeeping, which always runs against config('database.default') no
+      # matter which connection an individual migration targets. .env.testing.example points
+      # that default at local sqlite specifically so it never touches a real Tailscale DB.
+      # php8.3-gd is for tests that generate fake upload images
+      # (Illuminate\Http\Testing\FileFactory::image(), used by animal/report photo tests).
+      - name: Install PHP 8.3 and required extensions
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y php8.3-cli php8.3-mbstring php8.3-bcmath php8.3-curl \
+            php8.3-xml php8.3-zip php8.3-mysql php8.3-pgsql php8.3-sqlite3 php8.3-gd
+
+      - name: Install Composer
+        run: |
+          command -v composer >/dev/null 2>&1 && exit 0
+          curl -sS https://getcomposer.org/installer | php
+          sudo mv composer.phar /usr/local/bin/composer
+          sudo chmod +x /usr/local/bin/composer
+
+      - name: Install Composer dependencies
+        run: composer install --no-interaction --prefer-dist --optimize-autoloader
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install npm dependencies
+        run: npm ci
+
+      # --with-deps installs Chromium's system libraries via apt; runner user
+      # has passwordless sudo (see actions-runner-setup.md) so this runs
+      # non-interactively.
+      - name: Install Playwright Chromium
+        run: npx playwright install --with-deps chromium
+
+      - name: Build frontend assets
+        run: npm run build
+
+      # database/testing.sqlite is gitignored (it's a local artifact, not app data - see the
+      # pdo_sqlite comment above) so a fresh checkout never has it; the sqlite driver needs
+      # the file to actually exist, not just the extension.
+      - name: Configure test environment
+        run: |
+          cp .env.testing.example .env.testing
+          mkdir -p database
+          touch database/testing.sqlite
+
+      - name: Reset the 5 distributed test databases
+        run: php artisan db:fresh-all --env=testing --force
+
+      - name: Run browser test suite
+        run: php artisan test --env=testing --testsuite=Browser
