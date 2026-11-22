@@ -5,3 +5,4 @@ terraform.tfvars
 .terraform.lock.hcl
 __pycache__/
 *.pyc
+.idea/

@@ -19,16 +19,17 @@ The ASW repo is untouched. Nothing below has been done. Do the steps in order.
 - [ ] Move the instant-sync webhook from the ASW repo to `ws2-infra-homelab`.
 - [ ] Confirm the app syncs with no diff before touching ASW.
 
-## 4. Fix the image-tag loop (the real coupling)
-`deploy.yml` in ASW builds images and runs `sed` + `git commit` on `k8s/deployment.yaml` and
-`k8s/nginx-deployment.yaml`. After the move it must commit to `ws2-infra-homelab` instead:
-- [ ] Create a fine-grained PAT (or deploy key) with write access to `ws2-infra-homelab` only; store it
-      in Vault, not in the repo.
-- [ ] Change the job to check out `ws2-infra-homelab`, bump the tags there, and push.
-- [ ] Its Ansible steps use `working-directory: infrastructure/ansible`; check out `ws2-infra-homelab`
-      for those too, or move those jobs.
+## 4. Image-tag loop (workflows written, not yet live)
+ASW `deploy.yml` now builds and pushes images, then sends `repository_dispatch`
+(`asw-image-built`) to this repo. `bump-image-tag.yml` here commits the new tag to `k8s/`.
+`deploy-db.yml` here replaces the old `deploy-db` job. Before the first run:
+- [ ] Create a fine-grained PAT on this repo only (Contents: read/write; covers dispatch).
+- [ ] `vault kv patch secret/asw-cd infra_repo_pat=<pat>` (new field, same path as the others).
+- [ ] Register the self-hosted runner on this repo (needed by `deploy-db.yml`, drift check).
+- [ ] **Push this repo first**, so the receiver exists, **then** push ASW.
+- [ ] Check Actions: ASW build job, then `Bump image tag` here, then ArgoCD sync.
 
-## 5. Remove from ASW (last, one commit)
+## 5. Remove from ASW (done locally in ASW, not yet pushed)
 - [ ] Delete `infrastructure/`, `k8s/`, `terraform-drift.yml`, and the five moved docs.
 - [ ] Fix about 20 doc/comment references to `infrastructure/...` and `k8s/...`, plus
       `docs/README.md` links and `CLAUDE.md`.
