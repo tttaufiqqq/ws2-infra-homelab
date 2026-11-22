@@ -19,6 +19,7 @@ These were written alongside the build, in the application repository, and moved
 - [Backups](10-backups.md): coordinated cross-database backups, retention, the restore drill and alerting.
 - [CI](11-ci.md): the self-hosted GitHub Actions runner, why it was self-hosted, and a real upstream Action bug found running it.
 - [CD](12-cd.md): automatic deploy on green tests, path-based routing and the rollback design.
+- [Report upload 413](13-report-upload-413.md): report submissions hanging on nginx's default 1MB body limit, and the fix.
 
 ## Other folders
 
