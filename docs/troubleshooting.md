@@ -1,6 +1,6 @@
 # Troubleshooting
 
-This article lists problems met while building the environment and how each was resolved. Fuller write-ups are in [Terraform](07-terraform.md#lessons-learned-during-setup) and [Production hardening](09-production-hardening.md).
+This article lists problems met while building the environment and how each was resolved. Fuller write-ups are in [Terraform lessons](terraform-lessons.md) and [Production hardening](09-production-hardening.md).
 
 ## 1. Read the plan before applying
 
@@ -64,7 +64,7 @@ On an imported machine, an unexpected change in the first `plan` usually means a
 
 **Symptom:** actions fail with `execute command denied to user 'workshop_2'@'%'`, even though the app connects as `workshop_2_prod`.
 
-**Fix:** the prod database was populated by dump-restoring the old shared one, which kept every routine's `DEFINER=workshop_2@%`. Under the default `SQL SECURITY DEFINER` the privilege check runs as that old user, which had no access, so all 121 routines on the four MySQL and MariaDB hosts failed. Procedures and functions were switched to `SQL SECURITY INVOKER`, and triggers were re-created with the new definer. See [Production hardening](09-production-hardening.md#stored-proceduretrigger-privileges-broken-by-the-proddev-split-fixed-same-day).
+**Fix:** the prod database was populated by dump-restoring the old shared one, which kept every routine's `DEFINER=workshop_2@%`. Under the default `SQL SECURITY DEFINER` the privilege check runs as that old user, which had no access, so all 121 routines on the four MySQL and MariaDB hosts failed. Procedures and functions were switched to `SQL SECURITY INVOKER`, and triggers were re-created with the new definer. See [Production hardening](09-production-hardening.md#29-stored-routine-privileges-after-the-proddev-split).
 
 ## 11. Rolling update stuck pending
 

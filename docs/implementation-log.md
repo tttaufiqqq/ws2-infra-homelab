@@ -45,11 +45,11 @@ Run a five-database, three-engine Laravel app on a personal Proxmox homelab as i
 
 ### 4.1 Adopting running machines
 
-Provider defaults for `on_boot`, `started`, `scsi_hardware` and `cdrom` silently differ from a real host, so a first `plan` wanted to change healthy machines. Each was declared explicitly to match reality. Full detail in [Terraform](07-terraform.md#importing-the-real-production-vmscts-three-proxmox_virtual_environment_vm-defaults-that-silently-diverge-from-reality).
+Provider defaults for `on_boot`, `started`, `scsi_hardware` and `cdrom` silently differ from a real host, so a first `plan` wanted to change healthy machines. Each was declared explicitly to match reality. Full detail in [Terraform](terraform-lessons.md#5-imported-vms-show-changes-on-the-first-plan).
 
 ### 4.2 Secrets
 
-The first Vault integration still left passwords in `.env` and cached config. Four real bugs surfaced while deploying it: mismatched env names for the payment gateway, two DB hosts pointing at a host with no database, a missing filesystem disk setting, and a missing marker file that would have reseeded demo data over live data. Detail in [Production hardening](09-production-hardening.md#secrets-moved-to-vault).
+The first Vault integration still left passwords in `.env` and cached config. Four real bugs surfaced while deploying it: mismatched env names for the payment gateway, two DB hosts pointing at a host with no database, a missing filesystem disk setting, and a missing marker file that would have reseeded demo data over live data. Detail in [Production hardening](09-production-hardening.md#212-secrets-moved-to-vault).
 
 ### 4.3 Firewalls
 

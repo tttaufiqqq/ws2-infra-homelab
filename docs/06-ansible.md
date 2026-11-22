@@ -1,214 +1,125 @@
-# Infrastructure as Code — Terraform + Ansible
+# Ansible
 
-## Why we use this approach
+This article explains how Terraform and Ansible split the work of building the fleet, and how to run the Ansible playbooks.
 
-This project runs a distributed database architecture across 6 machines on a single Proxmox host:
-one Laravel app-server, two MySQL hosts (shelter, animals), two MariaDB hosts (reporting, booking),
-and one PostgreSQL host (users) — see CLAUDE.md's Server Topology table. **Only 4 of these 6 are
-Terraform-managed VMs** (app-server, the original linux-mysql, linux-mariadb, linux-postgres); the
-other two (`linux-mysql-2`, `linux-mariadb-2`) are Proxmox **CTs** (containers) created later, when
-`shelter`+`animals` and `reporting`+`booking` were each split off a shared physical host onto their
-own dedicated machine (2026-07-20 — see `oracle-db-learning-proxmox/docs/12-mysql-shelter-animals-split/`
-and `docs/13-mariadb-reporting-booking-split/`). They were provisioned directly via Proxmox/`pct`,
-not `terraform apply`, and are configured by their own Ansible playbooks same as everything else —
-Terraform's VM count below is accurate for what Terraform itself manages, but don't read it as the
-total machine count for the project.
+## 1. Why two tools
 
-Without IaC, setting up this environment means manually clicking through Proxmox UI, SSHing into each VM,
-running commands by hand, and hoping you remember every step when you need to rebuild it.
-That works once. It breaks the second time — wrong config, forgotten step, different package version.
+Setting up six machines by hand means clicking through Proxmox, SSHing into each one and hoping every step is remembered on the second build. Infrastructure as code removes that.
 
-**Terraform** solves the creation problem.
-It talks to the Proxmox API and creates all 4 of its VMs from a single `terraform apply`.
-Every VM is defined in code: its ID, CPU, RAM, disk, network, and the cloud-init script that runs on first boot.
-If a VM is deleted or corrupted, `terraform apply` recreates it identically.
-The state of what exists is tracked in `terraform.tfstate` — Terraform always knows what it created.
-(The 2 CTs above aren't part of this state at all — rebuilding them means re-running their Ansible
-playbook against a manually-created CT, not `terraform apply`.)
+| Tool | Owns | Example |
+|---|---|---|
+| Terraform | What exists | VM ID, CPU, RAM, disk, network, cloud-init |
+| Ansible | What runs inside | Packages, databases, config files, firewall |
+| Tailscale | The network | Stable hostnames such as `linux-mysql`, with no port forwarding |
 
-**Ansible** solves the configuration problem.
-After Terraform creates its 4 VMs and they join Tailscale, Ansible SSHes into each one — plus the 2
-manually-created CTs — and installs the right software: MySQL on linux-mysql/linux-mysql-2, MariaDB
-on linux-mariadb/linux-mariadb-2, PostgreSQL on linux-postgres, PHP + Nginx + Composer on
-app-server. It also creates the `workshop_2_prod` database and user on each of the 5 DB servers (a
-`workshop_2_dev` database/user also exists on every server for local development, but that one isn't
-Ansible-managed — see CLAUDE.md's Database Connection Mapping), sets the correct permissions, and
-configures remote access — exactly as defined in the playbooks. Running the same playbook twice
-produces the same result (idempotent).
+- Change a database config: run Ansible. Terraform is not involved.
+- Add a Terraform-managed VM: Ansible picks it up from the inventory.
+- Running the same playbook twice gives the same result (idempotent).
 
-**The split between them is deliberate:**
-- Terraform owns what exists, for the 4 VMs it manages (disks, network)
-- Ansible owns what's inside every one of the 6 machines (packages, databases, config files)
+### 1.1 Which machines Terraform manages
 
-This means if you only change a database config, you run Ansible — no need to touch Terraform.
-If you need another Terraform-managed VM, add it to Terraform — Ansible picks it up automatically
-via inventory. A manually-created CT (like the 2 above) just needs its own Ansible playbook and an
-`inventory.yml` entry; Terraform is never involved for those.
+The fleet has six machines: the app server, two MySQL hosts (`shelter`, `animals`), two MariaDB hosts (`reporting`, `booking`) and one PostgreSQL host (`users`).
 
-**Tailscale is the network layer.**
-Every machine — Terraform VM or manually-created CT — joins the Tailscale network on first boot
-(via cloud-init for the VMs). This means they can all talk to the Laravel app and to each other
-using stable hostnames (`linux-mysql`, `linux-mariadb`, `linux-mysql-2`, `linux-mariadb-2`, etc.)
-regardless of what local IP they get. No port forwarding, no VPN config, no firewall rules to
-maintain.
+- Terraform created four of them as VMs: `app-server`, `linux-mysql`, `linux-mariadb` and `linux-postgres`.
+- `linux-mysql-2` and `linux-mariadb-2` are containers (CTs) created directly with Proxmox `pct` on 2026-07-20, when each shared host was split in two.
+- The CTs are configured by Ansible like every other host. They need a playbook and an inventory entry, and Terraform is never involved.
 
----
+The Terraform VM count is correct for what Terraform manages. It is not the total machine count. Later, the real fleet was imported into Terraform ([Terraform](07-terraform.md)).
 
-## Ansible — Configuration Management
+## 2. Setup
 
-Ansible runs from your WSL Ubuntu instance and configures all 6 machines (Terraform's 4 VMs plus
-the 2 manually-created CTs). No agent or extra VM is needed — it connects over SSH via Tailscale.
-
-**SSH usernames are not uniform across these 6 machines** — cloud-init creates a `workshop` user on
-the 4 Terraform VMs, but in practice each machine ended up with its own convention over time
-(`workshop-2` for the reporting host, `workshop-mysql` for shelter, `workshop-postgres` for users,
-`linux-mysql-2`/`linux-mariadb-2` matching their own hostname for the 2 CTs, and `taufiq` for
-app-server specifically — see below). `ssh workshop@<host>` will fail on most of these; the actual
-per-host username is recorded in `~/.ssh/config` (Host blocks with an explicit `User` line) — check
-that file before assuming a username, don't guess from this doc.
-
-## One-time WSL setup
+Ansible runs from a WSL Ubuntu instance. It needs no agent and connects over SSH through Tailscale.
 
 ```bash
-# 1. Install Ansible and pip dependencies
 sudo apt update && sudo apt install -y ansible python3-pip
 
-# 2. Install community collections (MySQL, PostgreSQL, Vault modules) + the
-#    Vault Python client the hashi_vault collection needs
-cd /mnt/c/Users/taufi/Documents/Dev/Animal-Shelter-Workshop/infrastructure/ansible
+cd infrastructure/ansible
 ansible-galaxy collection install -r requirements.yml
-pip3 install hvac
+pip3 install hvac        # Vault client used by the hashi_vault collection
 
-# 3. Set up your SSH key in WSL
-#    Option A: generate a new key
 ssh-keygen -t ed25519 -f ~/.ssh/id_ed25519
-
-#    Option B: copy your existing Windows key into WSL
-cp /mnt/c/Users/taufi/.ssh/id_ed25519 ~/.ssh/
-cp /mnt/c/Users/taufi/.ssh/id_ed25519.pub ~/.ssh/
-chmod 600 ~/.ssh/id_ed25519
-
-# 4. Make sure the PUBLIC KEY in ~/.ssh/id_ed25519.pub matches what you set
-#    in terraform.tfvars → ssh_public_key before running terraform apply.
-#    If they don't match, Ansible won't be able to SSH in.
 ```
 
-## Workflow after `terraform apply`
+The public key in `~/.ssh/id_ed25519.pub` must match `ssh_public_key` in `terraform.tfvars`. If they differ, Ansible cannot connect.
 
-```
-terraform apply
-    └── Terraform's 4 VMs created and boot
-            └── cloud-init runs:
-                    ├── creates 'workshop' user with your SSH key
-                    └── joins Tailscale (hostname = VM name)
+### 2.1 SSH usernames differ per host
 
-# The 2 manually-created CTs (linux-mysql-2, linux-mariadb-2) aren't part of
-# this flow at all — they're created directly via Proxmox/pct, then given
-# their own SSH user matching their hostname, then configured by Ansible
-# exactly like the Terraform VMs are.
+Cloud-init created a `workshop` user, but each machine later ended up with its own convention.
 
-# Wait ~60s for cloud-init to finish, then verify connectivity (check
-# ~/.ssh/config for the real per-host username first — see above):
-tailscale status                              # confirm all 6 machines appear
-ssh linux-mysql "echo ok"                     # uses ~/.ssh/config's mapped user
+| Host | SSH user |
+|---|---|
+| `linux-mysql-2`, `linux-mariadb-2` | Matches the hostname |
+| `app-server` | `taufiq` |
+| Other hosts | Varies; see below |
 
-# app-server.yml deploys as 'taufiq', not 'workshop' — it targets the real,
-# hand-configured box, which has a 'taufiq' user. A truly fresh Terraform VM
-# only gets 'workshop' from cloud-init, so app-server.yml won't run to
-# completion against one until a 'taufiq' user exists there too. See
-# docs/09-production-hardening.md's "Known follow-ups".
+`ssh workshop@<host>` fails on most hosts. The real username is the `User` line in `~/.ssh/config`. Check that file before guessing.
 
-# Every playbook that reads asw_secrets (all 5 DB playbooks + app-server.yml)
-# needs a scoped Vault AppRole in the environment first — see
-# oracle-db-learning-proxmox/docs/11-vault-approle-app-integration/ for how
-# asw-deploy was created. Never use the lab's Vault root token here.
-export VAULT_ROLE_ID="<asw-deploy role_id>"
-export VAULT_SECRET_ID="<asw-deploy secret_id>"
+## 3. Run the playbooks
 
-# Then run Ansible
-cd /mnt/c/Users/taufi/Documents/Dev/Animal-Shelter-Workshop/infrastructure/ansible
+After `terraform apply`, wait about 60 seconds for cloud-init to finish, then confirm connectivity.
 
-# Provision all 6 machines at once (5 DB playbooks + app-server, in
-# dependency order — see site.yml)
-ansible-playbook playbooks/site.yml
-
-# Or provision a single machine
-ansible-playbook playbooks/linux-mysql.yml
-ansible-playbook playbooks/linux-mysql-2.yml
-ansible-playbook playbooks/linux-mariadb.yml
-ansible-playbook playbooks/linux-mariadb-2.yml
-ansible-playbook playbooks/linux-postgres.yml
-ansible-playbook playbooks/app-server.yml
-```
-
-## Inventory — updating Tailscale IPs
-
-If Tailscale MagicDNS is enabled, hostnames resolve automatically and `inventory.yml` works as-is.
-
-If not, get the Tailscale IPs after `terraform apply`:
 ```bash
-tailscale status
+tailscale status              # all six machines should appear
+ssh linux-mysql "echo ok"     # uses the user from ~/.ssh/config
 ```
 
-Then edit `inventory.yml` and replace `ansible_host` values with the actual IPs:
+Every playbook that reads `asw_secrets` needs a scoped Vault AppRole in the environment. Never use the Vault root token.
+
+```bash
+export VAULT_ROLE_ID="<asw-deploy role id>"
+export VAULT_SECRET_ID="<asw-deploy secret id>"
+
+cd infrastructure/ansible
+ansible-playbook playbooks/site.yml          # all six machines, in dependency order
+ansible-playbook playbooks/linux-mysql.yml   # or a single host
+```
+
+`app-server.yml` deploys as `taufiq`, because it targets the hand-configured box. A fresh Terraform VM only has `workshop`, so the playbook does not complete there until a `taufiq` user exists. See [Production hardening](09-production-hardening.md).
+
+### 3.1 Update Tailscale addresses
+
+If MagicDNS is on, hostnames resolve and `inventory.yml` works as is. If not, read the addresses with `tailscale status` and set `ansible_host` in `inventory.yml`.
+
 ```yaml
 linux-mysql:
   ansible_host: 100.x.x.x   # from tailscale status
 ```
 
-## What each playbook does
+## 4. What each playbook does
 
-| Playbook | Host | Installs / Does |
+| Playbook | Host | Result |
 |---|---|---|
-| `linux-mysql.yml` | linux-mysql | MySQL 8.0, creates workshop_2_prod DB + user, enables remote + triggers, UFW |
-| `linux-mysql-2.yml` | linux-mysql-2 | MySQL 8.0, creates workshop_2_prod DB + user, enables remote + triggers, UFW |
-| `linux-mariadb.yml` | linux-mariadb | MariaDB, creates workshop_2_prod DB + user, enables remote, UFW |
-| `linux-mariadb-2.yml` | linux-mariadb-2 | MariaDB, creates workshop_2_prod DB + user, enables remote, UFW |
-| `linux-postgres.yml` | linux-postgres | PostgreSQL, creates workshop_2_prod DB + user, pg_hba + schema grants, UFW |
-| `app-server.yml` | app-server | PHP 8.3 + extensions, Nginx, Node 20, Composer, UFW; clones repo to `/home/taufiq/Animal-Shelter-Workshop`, deploys `.env` from Vault (`asw_secrets`, re-rendered every run), builds frontend assets, runs `migrate --force` + a first-deploy-only `db:seed` — **never** `db:fresh-all` (see `docs/09-production-hardening.md`) |
-| `site.yml` | all 6 | `import_playbook`s the 5 DB playbooks above then app-server.yml, in that order |
+| `linux-mysql.yml`, `linux-mysql-2.yml` | MySQL hosts | MySQL 8.0, `workshop_2_prod` database and user, remote access, triggers, UFW |
+| `linux-mariadb.yml`, `linux-mariadb-2.yml` | MariaDB hosts | MariaDB, `workshop_2_prod` database and user, remote access, UFW |
+| `linux-postgres.yml` | PostgreSQL host | PostgreSQL, database and user, `pg_hba`, schema grants, UFW |
+| `app-server.yml` | App server | PHP 8.3 and extensions, nginx, Node 20, Composer, UFW, then the deploy below |
+| `site.yml` | All six | Imports the five database playbooks, then `app-server.yml` |
 
-## Verifying DB setup
+A `workshop_2_dev` database and user also exist on each server for local development. Ansible does not manage them.
 
-Usernames below match `~/.ssh/config`'s actual mapping — verify against that file, don't assume:
+### 4.1 What `app-server.yml` deploys
+
+1. Clones the repository to `/home/taufiq/Animal-Shelter-Workshop`.
+2. Renders `.env` from `templates/env-app.j2`, taking every credential from Vault through `asw_secrets`. It re-renders on every run.
+3. Runs `composer install` and `npm ci && npm run build`.
+4. Installs the nginx site from `templates/nginx-app.conf.j2`. It serves plain HTTP on port 80, because the Cloudflare Tunnel terminates TLS unless `-e use_certbot=true` is passed.
+5. Runs `migrate --force` every time, and `db:seed --force` only on the first deploy, gated on `storage/.provisioned`.
+
+The playbook never runs `db:fresh-all` ([Production hardening](09-production-hardening.md)). Re-running it is safe, because every task is idempotent.
+
+## 5. Verify
+
+Check usernames against `~/.ssh/config` first. Enter the database password when prompted.
 
 ```bash
-# MySQL
-ssh linux-mysql "mysql -u workshop_2_prod -pworkshop_2_prod -e 'SHOW DATABASES;'"
-ssh linux-mysql-2 "mysql -u workshop_2_prod -pworkshop_2_prod -e 'SHOW DATABASES;'"
-
-# MariaDB
-ssh linux-mariadb "mysql -u workshop_2_prod -pworkshop_2_prod -e 'SHOW DATABASES;'"
-ssh linux-mariadb-2 "mysql -u workshop_2_prod -pworkshop_2_prod -e 'SHOW DATABASES;'"
-
-# PostgreSQL
+ssh linux-mysql   "mysql -u workshop_2_prod -p -e 'SHOW DATABASES;'"
+ssh linux-mariadb "mysql -u workshop_2_prod -p -e 'SHOW DATABASES;'"
 ssh linux-postgres "psql -U workshop_2_prod -d workshop_2_prod -c '\l'"
-
-# PHP on app-server
 ssh linux-app-server "php -v && nginx -v && composer --version"
 ```
 
-## Full infrastructure flow
+## 6. Full flow
 
-```
-1. terraform init && terraform apply        → Terraform's 4 VMs created on Proxmox
-   (the 2 manually-created CTs, linux-mysql-2/linux-mariadb-2, already exist
-   separately — see "Why we use this approach" above)
-2. VMs boot, cloud-init joins Tailscale     → all 6 machines appear in tailscale status
-3. ansible-playbook playbooks/site.yml      → software installed, DBs configured,
-                                               app deployed, migrations + seed run
-```
-
-`app-server.yml` handles the full application deployment end-to-end:
-- Clones the repo to `/home/taufiq/Animal-Shelter-Workshop` (as `taufiq` user)
-- Deploys `.env` from `templates/env-app.j2`, sourcing every credential (5 DB passwords,
-  `APP_KEY`, Cloudinary, ToyyibPay, SMTP) from Vault via `asw_secrets` — re-rendered on
-  every run, not just the first
-- Runs `composer install`, `npm ci && npm run build`
-- Deploys the Nginx site config from `templates/nginx-app.conf.j2` (plain HTTP on `:80` —
-  TLS is terminated by the Cloudflare Tunnel, not certbot, unless `-e use_certbot=true`
-  is passed explicitly)
-- Runs `migrate --force` (always, idempotent) and `db:seed --force` (first deploy only,
-  gated on `storage/.provisioned`) — never `db:fresh-all`
-
-After the first run, re-running `ansible-playbook playbooks/app-server.yml` is safe — all tasks are idempotent, including `.env`: it re-renders from Vault every time but produces the same content unless a secret actually changed.
+1. `terraform init && terraform apply` creates the Terraform-managed VMs on Proxmox. The two CTs already exist.
+2. The machines boot, cloud-init joins them to Tailscale, and all six appear in `tailscale status`.
+3. `ansible-playbook playbooks/site.yml` installs software, configures the databases and deploys the app.

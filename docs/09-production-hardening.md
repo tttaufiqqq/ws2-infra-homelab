@@ -1,328 +1,159 @@
-# Production Hardening
+# Production hardening
 
-This app was originally deployable but not production-grade for unattended, single-user homelab
-operation — a redeploy could wipe production data, password reset was silently broken, timestamps
-on the `users` connection were off by ~8 hours, and there was no TLS, no backups, and no runtime
-services beyond the web request/response cycle. This document records what changed, why, and what's
-still a deliberate follow-up rather than something silently left undone.
+This article records what changed to make the app deployable for unattended, single-user homelab operation, and which items were left as deliberate follow-ups.
 
-**What "production" means for this project**: this is a portfolio deployment — the point is for
-other people to see the engineering work, not to serve real users or hold real data. There is no
-real user base and no real data to protect. That scope deliberately caps how far some of this
-hardening goes: e.g. the payment gateway stays on ToyyibPay's sandbox permanently (see the ToyyibPay
-bullet below) rather than ever switching to live payments, since there's no real money or real
-adopters involved. Treat "production-grade" throughout this doc as "handled the way a real deploy
-would be," not "actually serving real users."
+## 1. Scope
 
-## What changed
+The original deploy could wipe production data, password reset was silently broken, `users` timestamps were off by about 8 hours, and there was no TLS, no backups and no scheduler.
 
-### Deploy pipeline no longer destroys data
+"Production" here means a portfolio deployment. The goal is to show the engineering work, not to serve real users, and there is no real data to protect. That caps some choices: the payment gateway stays on ToyyibPay's sandbox permanently, and "production-grade" means "handled the way a real deploy would be".
 
-`infrastructure/ansible/playbooks/app-server.yml` used to run `php artisan db:fresh-all --seed` on
-**every** deploy — that command drops every table on all 5 databases and reseeds from scratch. Any
-redeploy after go-live would have wiped real data. It's now: `optimize:clear` → `migrate --force`
-(always, idempotent) → `db:seed --force` gated on a `storage/.provisioned` flag file that only gets
-created once → `config:cache`/`route:cache`/`view:cache`/`event:cache` → `storage:link`.
-`db:fresh-all` is no longer called anywhere in the playbook. The `git` clone task also now uses
-`update: true` so a redeploy actually pulls new commits. `APP_KEY` no longer comes from
-`key:generate` at all — see "Secrets moved to Vault" below.
+## 2. What changed
 
-A real `--check --diff` run against the live box (done as part of the Vault work below) surfaced a
-gap in this exact gating logic: `storage/.provisioned` was missing on the live `app-server`, since
-the box was hand-configured outside this playbook and had never actually gone through a real
-deploy. Left as-is, the very first real run would have read as a first deploy and triggered
-`db:seed --force` against the live databases — inserting seeder demo/starter records on top of real
-data (102 real animal rows, real user accounts, and everything else already live). An empty
-`storage/.provisioned` was created directly on the box before any real deploy — the same marker the
-playbook's own "Mark server as provisioned" task would create on a first run — so the seed step is
-now correctly skipped going forward.
+### 2.1 The deploy no longer destroys data
 
-The two migrations that had only ever run against the `_test` databases —
-`0001_01_01_000001_create_password_reset_tokens_table` and
-`2026_01_13_000002_add_remember_token_to_users_table` — were applied to the real production
-`workshop_2` databases as a one-time catch-up. Password reset was silently broken in production
-until this ran.
+**Problem:** `app-server.yml` ran `php artisan db:fresh-all --seed` on every deploy. That command drops every table on all five databases, so any redeploy after go-live would have wiped real data.
 
-### Timezone alignment
+**Fix:** the deploy now runs these steps in order:
 
-`config/app.php`'s timezone is `Asia/Kuala_Lumpur`, but none of the 5 DB connections set a session
-timezone, so every PHP-side timestamp write disagreed with the database by ~8 hours (`audit_logs`,
-Eloquent `updated_at`, `User::isLocked()`'s comparison against `locked_until`). `config/database.php`
-now sets `'timezone'` on all 5 connections — `'Asia/Kuala_Lumpur'` for `users` (PostgreSQL, which has
-its own tzdata), `'+08:00'` for the 4 MySQL/MariaDB connections (the named zone isn't loaded on those
-servers; Malaysia has no DST, so a fixed offset is exact and never drifts). This also fixed a
-documented time-of-day-dependent flake in `tests/Procedures/BookingTriggersTest.php`.
+1. `optimize:clear`
+2. `migrate --force` (always, idempotent)
+3. `db:seed --force`, gated on a `storage/.provisioned` flag file created once
+4. `config:cache`, `route:cache`, `view:cache`, `event:cache`
+5. `storage:link`
 
-### Session/cache/queue decoupled from the `users` database
+`db:fresh-all` is no longer called anywhere in the playbook. The `git` task uses `update: true`, so a redeploy pulls new commits.
 
-Production's `.env` had `CACHE_STORE=database` and `SESSION_DRIVER=database`, both of which resolve
-to the `users` (PostgreSQL) connection — meaning a single Postgres outage would have taken down every
-page's session along with it, undermining the graceful-degradation behavior the app otherwise tests
-for. Both are now `file`, matching what the app's own DB circuit breaker already assumes internally.
-`QUEUE_CONNECTION` is now `sync` — there are no `Jobs`/`Mail`/`Notifications` classes and no
-`ShouldQueue` usage anywhere in `app/`, so a database-backed queue needing its own worker process was
-unused complexity.
+A `--check --diff` run against the live box found a gap in that gate. `storage/.provisioned` was missing, because the box had been configured by hand and never deployed by the playbook. The first real run would have seeded demo records on top of live data (102 real animal rows and the user accounts). An empty `storage/.provisioned` was created on the box first.
 
-### Scheduler runs via systemd
+Two migrations that had only run against the `_test` databases were applied to production as a one-time catch-up: `create_password_reset_tokens_table` and `add_remember_token_to_users_table`. Password reset was broken until then.
 
-`routes/console.php` schedules `db:refresh-status` (every minute) and `taufiq:refresh-stats` (every 5
-minutes), but nothing ever invoked `php artisan schedule:run` on a recurring basis in production —
-both had been silently dead in every deployment so far. A systemd timer
-(`infrastructure/ansible/templates/laravel-scheduler.timer.j2`, fires every minute) now drives a
-oneshot service that runs `schedule:run`. No queue worker was added — see above.
+### 2.2 Timezone alignment
 
-### TLS via nginx + Let's Encrypt
+**Problem:** `config/app.php` uses `Asia/Kuala_Lumpur`, but no connection set a session timezone. PHP-side writes disagreed with the database by about 8 hours (`audit_logs`, `updated_at`, `User::isLocked()`).
 
-nginx used to listen on `:80` only. The playbook now requires `app_domain` and `certbot_email`
-variables (fails early with a clear message if either is missing — a public DNS record for
-`app_domain` and inbound `:443` must already be in place), obtains a certificate via certbot's
-webroot challenge, and serves `:443` with HSTS, `X-Frame-Options`, `X-Content-Type-Options`,
-`Referrer-Policy`, and `X-XSS-Protection`. `:80` redirects to `:443` once a certificate exists.
-`APP_URL` is now `https://{{ app_domain }}`, `SESSION_SECURE_COOKIE`/`SESSION_ENCRYPT` are both
-`true`, and `AppServiceProvider::boot()` calls `URL::forceScheme('https')` in production (nginx
-terminates TLS and proxies plain HTTP to php-fpm, so Laravel never sees `https://` directly).
+**Fix:** `config/database.php` now sets `timezone` on all five connections.
 
-**Deliberately not added yet: a Content-Security-Policy.** The app loads several external CDNs
-(Tailwind, Font Awesome, Leaflet, Nominatim for reverse geocoding) — a CSP needs its own scoped pass
-to enumerate every legitimate external origin without breaking the map/geocoding flow. Flagged here
-as a follow-up, not silently skipped.
+| Connection | Value | Reason |
+|---|---|---|
+| `users` (PostgreSQL) | `Asia/Kuala_Lumpur` | Has its own tzdata |
+| The four MySQL and MariaDB connections | `+08:00` | The named zone is not loaded, and Malaysia has no DST, so a fixed offset is exact |
 
-### Trusted proxies
+This also fixed a time-of-day flake in `tests/Procedures/BookingTriggersTest.php`.
 
-The public request path is `Cloudflare (real TLS termination) → cloudflared tunnel → nginx
-(localhost:80) → php-fpm`. `cloudflared` and nginx both run on the same app-server box, so every
-request php-fpm actually sees arrives from `127.0.0.1` — the real client's IP and the fact the
-original request was HTTPS only exist in the `X-Forwarded-For`/`X-Forwarded-Proto` headers Cloudflare
-attaches. Laravel trusts none of those headers by default (a proxy you don't control could otherwise
-have a client forge them), so `$request->ip()` returned the proxy's own address and
-`$request->isSecure()` returned `false` even on a real HTTPS visit — `URL::forceScheme('https')` (see
-above) was already masking the symptom for generated links, but anything reading `isSecure()`
-directly still saw plain HTTP.
+### 2.3 Sessions, cache and queue off the `users` database
 
-Fixed in `bootstrap/app.php` — `$middleware->trustProxies(at: ['127.0.0.1'])`. `127.0.0.1` specifically
-(not `'*'`) because that's the one fixed, known hop in this chain (cloudflared → nginx are always
-local to each other); no other proxy sits between the internet and this box.
+**Problem:** `CACHE_STORE=database` and `SESSION_DRIVER=database` both resolved to the PostgreSQL `users` connection, so one Postgres outage would have broken every page.
 
-### Mail
+**Fix:** both are now `file`. `QUEUE_CONNECTION` is `sync`, because the app has no queued jobs, mail or notifications.
 
-Production had no `MAIL_*` configuration at all, so it silently used Laravel's own `log` mailer
-default — password reset emails were written to `storage/logs` instead of being sent.
-`infrastructure/ansible/templates/env-app.j2` now has a full SMTP block (`MAIL_MAILER`, `MAIL_HOST`,
-`MAIL_PORT`, `MAIL_USERNAME`, `MAIL_PASSWORD`, `MAIL_SCHEME`, `MAIL_FROM_ADDRESS`, `MAIL_FROM_NAME`),
-templated the same way as the existing Cloudinary/ToyyibPay blocks. **This is the one setting that
-needs a real external secret** — supply working SMTP credentials (a Gmail app password, SendGrid,
-Mailgun, or a homelab relay) via `-e` or a vaulted vars file before deploying, or password reset will
-continue to silently do nothing.
+### 2.4 Scheduler on a systemd timer
 
-### Automated backups — superseded, see docs/10-backups.md
+`routes/console.php` schedules `db:refresh-status` (every minute) and `taufiq:refresh-stats` (every 5 minutes), but nothing ran `schedule:run`, so both were dead. A systemd timer (`laravel-scheduler.timer.j2`) now fires every minute and runs a oneshot service. No queue worker was added.
 
-This section originally described a per-host `mysqldump`/`pg_dump` nightly timer on each of the 3 DB
-VMs (`templates/backup-{mysql,postgres}.sh.j2`, `/var/backups/workshop_2` on each host). That approach
-had exactly the gaps called out below (no off-VM copy, no restore drill) plus two more found later: it
-never covered `msi` at all (a Windows machine, unreachable by these Linux playbooks) and had no
-cross-database consistency check, despite the app having 12 undeclared logical foreign keys across
-3 servers (`docs/04-foreign-keys.md`).
+### 2.5 TLS
 
-It has been replaced with a single coordinated backup orchestrated from app-server
-(`php artisan db:backup`) that dumps all 5 physical databases (one per connection as of the
-2026-07-20 1-database-1-physical-machine split — see CLAUDE.md's Server Topology table), verifies
-the 12 logical foreign keys still resolve, checksums and centrally retains the result, and alerts
-on failure. **See
-`docs/10-backups.md` for the current architecture, retention policy, and restore runbook** — the
-per-host scripts and systemd units referenced above no longer exist.
+nginx used to listen on port 80 only. The playbook now requires `app_domain` and `certbot_email`, and fails early if either is missing. It gets a certificate by certbot's webroot challenge and serves port 443 with HSTS, `X-Frame-Options`, `X-Content-Type-Options`, `Referrer-Policy` and `X-XSS-Protection`. Port 80 redirects once a certificate exists.
 
-### Stored procedure/trigger privileges broken by the prod/dev split, fixed same day
+`APP_URL` is `https://{{ app_domain }}`, `SESSION_SECURE_COOKIE` and `SESSION_ENCRYPT` are `true`, and `AppServiceProvider::boot()` calls `URL::forceScheme('https')` in production, because nginx terminates TLS.
 
-Reported live: "Failed to delete report" / "Failed to assign caretaker" on the `reporting`
-connection, citing `execute command denied to user 'workshop_2'@'%'` — confusing, since the app
-correctly connects as `workshop_2_prod`. Root cause: `workshop_2_prod` was populated by
-dump-restoring the old shared `workshop_2` database (see CLAUDE.md's Server Topology table), which
-preserves every stored procedure/trigger's original `DEFINER=workshop_2@%` clause. Under
-`SQL SECURITY DEFINER` (MariaDB/MySQL's default), a routine's privilege checks run against the
-*definer's* account, not the caller's — and `workshop_2` has zero privileges on `workshop_2_prod`
-(its grants are deliberately scoped to the test databases only), so **nobody** could call these
-routines, not even `root`. This affected all 121 stored procedures/triggers across all 4
-MySQL/MariaDB hosts (`reporting`, `booking`, `shelter`, `animals`) — a full outage of the entire
-stored-procedure layer, not just the two actions reported. `users` (PostgreSQL) was unaffected —
-its functions were already correctly owned and don't use `SECURITY DEFINER`.
+A Content-Security-Policy was deliberately not added. The app loads several CDNs (Tailwind, Font Awesome, Leaflet, Nominatim), and a CSP needs its own pass so it does not break the map.
 
-Fixed live via SQL, no app code or Ansible changes needed: procedures/functions switched to
-`SQL SECURITY INVOKER` (runs with the caller's privileges instead of a fixed definer — immune to
-this exact bug recurring on any future credential rename); triggers (which have no
-`SQL SECURITY INVOKER` option) recreated with `DEFINER=workshop_2_prod@%`. Full root-cause detail,
-the exact commands run, and verification:
-[`oracle-db-learning-proxmox/docs/16-stored-routine-definer-privilege-split/`](https://github.com/tttaufiqqq/oracle-db-learning-proxmox/blob/main/docs/16-stored-routine-definer-privilege-split/stored-routine-definer-privilege-split.md).
+### 2.6 Trusted proxies
 
-### Animal delete now blocks on real adoption/booking references
+**Problem:** the request path is Cloudflare, then the `cloudflared` tunnel, then nginx on port 80, then php-fpm. Every request arrives from `127.0.0.1`, and Laravel trusts no forwarded headers by default. `$request->ip()` returned the proxy and `isSecure()` returned `false` on real HTTPS visits.
 
-`ManagesAnimals::destroy()` called the delete procedure with no check for referencing rows on the
-`booking` connection (`adoption`, `animal_booking`) — a different physical server, so no real foreign
-key could enforce this. Deleting an adopted or booked animal silently orphaned those rows (this was
-already proven by `tests/Feature/CrossDb/OrphanRiskTest.php`, which asserted the orphan happening).
-The controller now checks for any referencing row first and blocks the delete with a clear error if
-one exists — matching the guard pattern already used in `ManagesReports::destroy()`. It fails closed
-if the `booking` connection itself is unreachable, rather than proceeding without being able to
-verify. `OrphanRiskTest.php` was inverted to assert the block; verified red-then-green.
+**Fix:** `$middleware->trustProxies(at: ['127.0.0.1'])` in `bootstrap/app.php`. It trusts `127.0.0.1` and not `'*'`, because that is the only known hop.
 
-### Logging
+### 2.7 Mail
 
-`LOG_STACK` was never set in production, so `LOG_CHANNEL=stack` silently fell back to `'single'` — an
-unbounded `storage/logs/laravel.log`. It's now `LOG_STACK=daily`, using `config/logging.php`'s own
-14-day default retention. nginx's own access/error logs don't need a new logrotate entry — Ubuntu's
-`nginx` package already ships one via `nginx-common`.
+**Problem:** production had no `MAIL_*` settings, so it used the `log` mailer and password reset emails went to `storage/logs`.
 
-**Existing health surfaces, now worth pointing a monitor at**: Laravel's built-in `/up`
-(`bootstrap/app.php`) and this app's own `/api/database-status` (`routes/web.php`), which reports
-per-connection reachability. External error tracking (Sentry/Flare) is intentionally out of scope for
-a single-user homelab — the daily log is the sink.
+**Fix:** `env-app.j2` has a full SMTP block (`MAIL_MAILER`, `MAIL_HOST`, `MAIL_PORT`, `MAIL_USERNAME`, `MAIL_PASSWORD`, `MAIL_SCHEME`, `MAIL_FROM_ADDRESS`, `MAIL_FROM_NAME`). The provider is Resend, with the domain verified for SPF, DKIM and DMARC. The key lives in Vault.
 
-### Secrets moved to Vault
+### 2.8 Backups
 
-App-server's credentials lived in three places at once: `env-app.j2` hardcoded all five
-`DBn_PASSWORD`s as the literal `workshop_2`, the three `linux-{mysql,mariadb,postgres}.yml`
-playbooks hardcoded the *same* password again as a play var, and the real Resend SMTP key existed
-only hand-applied to the live `.env` (see the now-resolved path-mismatch entry below) — nowhere in
-any repo. All of it now comes from one Vault path, `secret/animal-shelter-workshop` on
-`linux-vault`, read at deploy time via `community.hashi_vault`'s `vault_kv2_get` lookup
-(`infrastructure/ansible/group_vars/all.yml`), authenticated with a scoped, read-only AppRole
-(`asw-deploy`) rather than the lab's root token. `APP_KEY` moved in too, which is what makes the
-`.env` template genuinely re-renderable now (`force: true` — see below) instead of a first-deploy-
-only artifact. See `oracle-db-learning-proxmox/docs/11-vault-approle-app-integration/` for the
-policy and AppRole setup.
+The first design was a per-host dump timer. It had no off-VM copy, no restore drill and no consistency check across databases. It was replaced by one coordinated backup run from the app server (`php artisan db:backup`). See [Backups](10-backups.md).
 
-Preparing this also surfaced three pre-existing bugs in `env-app.j2` that predate the Vault change
-and would have bitten on the very first real run of this playbook, `force: true` or not:
-`TOYYIBPAY_SECRET_KEY`/`TOYYIBPAY_CATEGORY_CODE` never matched what `config/toyyibpay.php` actually
-reads (`TOYYIBPAY_KEY`/`TOYYIBPAY_CATEGORY`) — fixed. `DB2_HOST`/`DB3_HOST` (shelter/animals) were
-hardcoded to `linux-mysql` (`100.115.237.93`, the Proxmox MySQL VM), but that host has no
-`workshop_2` database at all — confirmed live (`Unknown database 'workshop_2'`). The real
-shelter/animal data (102 rows in `animal`, confirmed live) is on `msi` (`100.68.235.121`), matching
-CLAUDE.md's connection table and the live `.env`. Both now use the correct host. Most seriously,
-found via an actual `--check --diff` run against the live box: `env-app.j2` never set
-`FILESYSTEM_DISK` at all — `config/filesystems.php` defaults that to `'local'` when unset, which
-would have silently moved every upload off Cloudinary onto local disk on the first real deploy.
-Fixed (`FILESYSTEM_DISK=cloudinary`, a plain literal — not a secret, not Vault-sourced). The same
-dry run's diff also showed `BOOKING_PREFER_SQLSRV`, `VITE_APP_NAME`, and `BROADCAST_CONNECTION` as
-present in the live `.env` but absent from the template — checked all three against the actual
-codebase (`grep` across `app/`, `config/`, `resources/`) and confirmed all three are dead: no
-`config/broadcasting.php` exists at all, and the other two aren't referenced anywhere. Left out of
-the template deliberately, not missed. None of these four bugs had ever surfaced before because the
-playbook has never actually been run against the real box — see the path-mismatch entry below.
+### 2.9 Stored routine privileges after the prod/dev split
 
-Two consequences worth stating plainly:
-- Deploys depend on Vault being unsealed. Runtime *originally* didn't (`config:cache` baked
-  resolved values into compiled config, so an already-running app was unaffected if Vault went
-  down afterward) — that changed with Vault Agent below, which trades that independence for
-  actually getting secrets off disk. See "Secrets stopped touching disk entirely" just below for
-  the current tradeoff.
-- `key:generate` no longer runs at all; regenerating a key that's supposed to come from Vault would
-  silently diverge the two. The `.env` deploy task's `force: false` guard is also gone — Vault is
-  now the actual source of truth, not a one-time seed.
+**Symptom:** "Failed to delete report" and "Failed to assign caretaker" on `reporting`, with `execute command denied to user 'workshop_2'@'%'`, although the app connects as `workshop_2_prod`.
 
-### Secrets stopped touching disk entirely (Vault Agent)
+**Cause:** `workshop_2_prod` was filled by dump-restoring the old database, which kept every routine's `DEFINER=workshop_2@%`. Under the default `SQL SECURITY DEFINER`, privilege checks run as the definer, and `workshop_2` has no rights on `workshop_2_prod`. Nobody could call the routines, not even `root`. All 121 procedures and triggers on the four MySQL and MariaDB hosts failed. `users` (PostgreSQL) was unaffected.
 
-The section above closed "secrets hardcoded in the repo," but left a real gap open: every deploy
-still rendered every secret as plaintext into `.env`, and `config:cache` then baked the same
-resolved values into `bootstrap/cache/config.php` too — two plaintext copies on disk, readable by
-anyone with file access to app-server, not just remote code execution. Flagged at the time as a
-deliberate "not yet, but worth naming" — this is that follow-up.
+**Fix:** done live in SQL, with no code or Ansible change. Procedures and functions were switched to `SQL SECURITY INVOKER`. Triggers have no such option, so they were recreated with `DEFINER=workshop_2_prod@%`. The full write-up is in the homelab repository, `docs/16-stored-routine-definer-privilege-split/`.
 
-`infrastructure/ansible/playbooks/tasks/vault-agent.yml` now wraps php-fpm (via a systemd
-`ExecStart` override) and the migrate/seed CLI commands under `vault agent`, which injects secrets
-directly into the process environment via `env_template` stanzas — never written to a file.
-`env-app.j2` blanks every Vault-sourced field when this is active (a `secret()` Jinja macro, gated
-on a new `vault_agent_enabled` toggle in `group_vars/all.yml`), and `config:cache` is skipped
-entirely in this mode — caching would just re-bake the same secrets into
-`bootstrap/cache/config.php` regardless of where they came from, defeating the point.
-`vault_agent_enabled: false` fully reverts to the plain `env-app.j2` + `config:cache` flow,
-including removing the systemd override — tested for real, not just designed on paper.
+### 2.10 Animal delete checks real references
 
-Full design, the 6 real bugs hit getting it running for the first time (an invalid CLI flag on this
-Vault version, two file-permission mismatches between `root`/`taufiq`, `needrestart` hanging
-unattended `apt` installs, a recursive `chmod` silently making tracked files executable, and Vault
-Agent deduplicating identical `env_template` bodies so 4 of 5 identical DB passwords silently never
-reached the running app), and the resulting runtime tradeoff (php-fpm now needs Vault reachable at
-every restart, not just at deploy time) are in
-`oracle-db-learning-proxmox/docs/11-vault-approle-app-integration/`'s "Still Open" section.
+**Problem:** `ManagesAnimals::destroy()` did not check the `booking` connection (`adoption`, `animal_booking`). Those live on another server, so no foreign key could stop the delete, and adopted or booked animals orphaned rows.
 
-### Removed: non-functional email-verification scaffolding
+**Fix:** the controller now looks for referencing rows first and blocks the delete. It fails closed if `booking` is unreachable. `OrphanRiskTest.php` was inverted to assert the block, and verified red then green.
 
-Routes, controllers, and a view for Laravel's standard email-verification flow existed but were never
-wired up — `User` didn't implement `MustVerifyEmail`, no migration ever added an `email_verified_at`
-column, and registration never fired the event that would trigger a verification email. By explicit
-decision (a single-user deployment gets no real value from this), the scaffolding was removed rather
-than completed: the 3 controllers, the verification routes, the dead `<form>` in the profile page, and
-the now-meaningless `email_verified_at` cast on `User`.
+### 2.11 Logging
 
-## Known follow-ups (flagged, not silently skipped)
+`LOG_STACK` was unset, so logging fell back to one unbounded `laravel.log`. It is now `daily`, with the 14-day default retention. nginx logs already rotate through `nginx-common`.
 
-- **Content-Security-Policy** — needs its own pass to enumerate the CDN origins this app actually
-  loads without breaking the map/geocoding flow.
-- ~~Off-VM backup copies~~ / ~~a real restore drill~~ — **superseded**, see `docs/10-backups.md`:
-  backups are now centralized on app-server (closing the off-VM gap) with a documented, drillable
-  `--into-scratch` restore path.
-- **`TOYYIBPAY_BASE_URL` stays on the ToyyibPay sandbox** (`dev.toyyibpay.com`) **by design, not as an
-  open decision.** This project has no real users and no real money moving through it — it exists for
-  others to see the engineering work, not to process live payments. Switching to the live gateway is
-  explicitly out of scope, not a pending follow-up.
-- **Ansible syntax was never run through `ansible-playbook --syntax-check`** — this hardening pass was
-  done from a Windows dev machine with no `ansible`/Python installed. Every YAML file was reviewed by
-  hand for indentation and brace-balance correctness, but an automated syntax check on the actual
-  control node is worth doing before the next real deploy.
-- ~~`app-server.yml`'s deploy path doesn't match the real, live app-server~~ — **resolved.** The
-  playbook, `env-app.j2`, and the scheduler/nginx templates now target
-  `/home/taufiq/Animal-Shelter-Workshop` and `become_user: taufiq` throughout, matching the box as it
-  actually exists (confirmed via nginx's real `root` directive) rather than the `/var/www/animal-shelter`
-  / `workshop` layout that was never actually deployed. Decision taken: update Ansible to match reality,
-  not migrate the live site.
-- ~~One new gap this creates: a *fresh* Terraform-provisioned app-server VM only gets a `workshop` OS
-  user from cloud-init, not `taufiq`, and every real Ansible run so far has targeted the existing
-  hand-configured box, not one Terraform actually created~~ — **resolved, on two fronts.** The
-  `taufiq` user gap was closed in `cloud-init.yml.tftpl` (see `docs/07-terraform.md`), and the
-  "targeted the hand-configured box" framing itself no longer applies: `app-server` (VM 101) and the
-  rest of the real production fleet are now adopted into Terraform state directly via `terraform
-  import` (see `docs/07-terraform.md`'s "VMs/CTs managed by Terraform" table), not just proven once
-  against a disposable, torn-down test set. The distinction that mattered here — Terraform-created vs.
-  hand-configured — is gone; the real box itself is what Terraform manages now.
-- ~~SMTP credentials still needed~~ — **done, and now in Vault.** Resend is the provider
-  (`smtp.resend.com`, username `resend`), domain `mail.tttaufiqqq.com` verified (SPF/DKIM/DMARC). The
-  real API key was originally applied by hand directly to app-server's live `.env`, existing in no
-  repo at all — it's now stored in Vault (`secret/animal-shelter-workshop`, see the Secrets moved to
-  Vault entry above) and rendered by the template like every other credential.
-  `Password::sendResetLink()` returned `passwords.sent`, no mail exception logged, and Resend's own
-  dashboard confirms the message was actually relayed to Gmail — it then **bounced**, but only
-  because the test recipient (`admin1@gmail.com`) is a seeded demo account
-  (`database/seeders/UserSeeder.php`), not a real inbox. A hard bounce from the real destination mail
-  server is evidence the relay itself works correctly (Resend accepted it, routed it, Gmail rejected
-  the *mailbox*, not the sender) — this was a bad choice of test recipient on my part, not a config
-  problem.
-- **Still open: confirm delivery to a real inbox.** Re-run the same `Password::sendResetLink()` test
-  against an email address that actually exists, and check it arrives (not just that Resend accepted
-  it) before calling this fully closed.
-- **Vault runs with `tls_disable = true`.** Fine behind Tailscale for DB-engine root passwords, but
-  the app's own secrets (including the Resend key and `APP_KEY`) now flow over that same unencrypted
-  listener too — Tailscale's own encryption covers the transport, but it's worth naming rather than
-  leaving unsaid. Not blocking for a lab with no real data; would be a real gap in an actual
-  production Vault.
+Two endpoints are worth monitoring: Laravel's `/up` and the app's `/api/database-status`, which reports per-connection reachability.
 
-## Verification
+### 2.12 Secrets moved to Vault
 
-Everything above was verified as directly as this environment allowed:
+**Problem:** credentials lived in three places. `env-app.j2` hardcoded all five `DBn_PASSWORD` values, the three database playbooks hardcoded the same password, and the Resend key existed only in the live `.env`.
 
-- The full Pest suite (`php artisan test --env=testing`) was re-run after every code-level change
-  (timezone config, the animal-delete guard, the email-verification removal) — **364 tests passed, 0
-  failed** each time, against the real distributed test databases, not mocks.
-- The two production migrations were applied and confirmed live via
-  `Schema::connection('users')->hasTable('password_reset_tokens')` and `hasColumn('users',
-  'remember_token')`.
-- The timezone fix was confirmed with a live probe comparing PHP's `now()` against each connection's
-  own session clock — the skew dropped from ~8 hours to sub-second.
-- The animal-delete guard was verified red-then-green: the updated tests fail without the fix (`git
-  stash` on just the controller change) and pass with it.
-- The `mysqldump` backup command was run directly against the real local MySQL instance (a safe,
-  read-only operation) and produced a valid dump containing real tables, procedures, and triggers.
-  `pg_dump` was reviewed by hand — no PostgreSQL client tools are installed on this dev machine.
-- What could **not** be verified from this environment: a live systemd timer actually firing, a real
-  TLS handshake against a public domain, an actual SMTP delivery, and a real backup restore drill —
-  all of these need the real homelab hardware and, in two cases, external secrets/domains this
-  session didn't have.
+**Fix:** everything now comes from one Vault path, `secret/animal-shelter-workshop` on `linux-vault`, read at deploy time with the `vault_kv2_get` lookup (`group_vars/all.yml`). A scoped, read-only AppRole (`asw-deploy`) authenticates, not the root token. `APP_KEY` moved too, so `.env` is re-rendered from Vault on every run.
+
+The preparation found four bugs that predate Vault:
+
+| Bug | Effect |
+|---|---|
+| `TOYYIBPAY_SECRET_KEY` and `_CATEGORY_CODE` did not match `config/toyyibpay.php` (`TOYYIBPAY_KEY`, `_CATEGORY`) | Payments misconfigured. Fixed |
+| `DB2_HOST` and `DB3_HOST` pointed at `linux-mysql`, which had no `workshop_2` database | Real shelter and animal data was on another host. Fixed |
+| `FILESYSTEM_DISK` was never set | Uploads would have moved off Cloudinary to local disk. Set to `cloudinary` |
+| `BOOKING_PREFER_SQLSRV`, `VITE_APP_NAME`, `BROADCAST_CONNECTION` in the live `.env` only | Confirmed unused by searching `app/`, `config/` and `resources/`. Left out on purpose |
+
+Consequences:
+
+- Deploys depend on Vault being unsealed.
+- `key:generate` no longer runs, because regenerating a key that comes from Vault would make the two diverge.
+
+### 2.13 Secrets never touch disk (Vault Agent)
+
+**Problem:** every deploy still wrote all secrets to `.env`, and `config:cache` baked them into `bootstrap/cache/config.php`. That left two plaintext copies readable by anyone with file access.
+
+**Fix:** `playbooks/tasks/vault-agent.yml` wraps php-fpm (a systemd `ExecStart` override) and the migrate and seed commands in `vault agent`. It injects secrets into the process environment from `env_template` stanzas, never to a file. `env-app.j2` blanks every Vault field when `vault_agent_enabled` is on, and `config:cache` is skipped. Setting it to `false` reverts to the plain flow, including removing the override. The revert was tested.
+
+Six bugs surfaced getting it running:
+
+- An invalid CLI flag on this Vault version
+- Two file permission mismatches between `root` and `taufiq`
+- `needrestart` hanging unattended `apt` installs
+- A recursive `chmod` that made tracked files executable
+- Vault Agent deduplicating identical `env_template` bodies, so 4 of 5 identical database passwords never reached the app
+
+The tradeoff is that php-fpm now needs Vault reachable on every restart. The full design is in the homelab repository, `docs/11-vault-approle-app-integration/`.
+
+### 2.14 Removed email-verification scaffolding
+
+Routes, controllers and a view for Laravel's verification flow existed but were never wired: `User` did not implement `MustVerifyEmail` and there was no `email_verified_at` column. A single-user deployment gets no value from it, so three controllers, the routes, a dead form and the cast were removed.
+
+## 3. Follow-ups
+
+| Item | Status |
+|---|---|
+| Content-Security-Policy | Open. Needs a pass over the CDN origins |
+| Off-VM backups and a restore drill | Closed by [Backups](10-backups.md) |
+| ToyyibPay on the sandbox (`dev.toyyibpay.com`) | By design, not a pending decision |
+| `ansible-playbook --syntax-check` | Open. The pass was written on a machine without Ansible |
+| Playbook path (`/home/taufiq/...`, user `taufiq`) | Closed. The playbook now matches the real box |
+| Fresh VM lacks a `taufiq` user | Closed. Fixed in `cloud-init.yml.tftpl`, and the real fleet is imported into Terraform ([Terraform](07-terraform.md)) |
+| SMTP credentials | Closed, and stored in Vault |
+| Confirm delivery to a real inbox | Open. The test hit a seeded demo address, which bounced. That proves the relay works, but a real address still needs testing |
+| Vault runs with `tls_disable = true` | Open. Tailscale encrypts the transport, which is acceptable for a lab but a real gap in production |
+
+## 4. Verification
+
+- The full Pest suite was re-run after every code change, with **364 tests passing** against real test databases.
+- The two migrations were confirmed live with `hasTable('password_reset_tokens')` and `hasColumn('users', 'remember_token')`.
+- The timezone fix was confirmed by comparing PHP's `now()` with each connection's session clock. The skew dropped from about 8 hours to under a second.
+- The animal-delete guard was checked red then green with `git stash` on the controller change.
+- The `mysqldump` command ran against the real local MySQL and produced a valid dump. `pg_dump` was reviewed by hand, because the dev machine had no PostgreSQL client.
+- **Not verified** from the dev environment: a live systemd timer firing, a real TLS handshake, real SMTP delivery and a restore drill. They need the real hardware, domains and secrets.

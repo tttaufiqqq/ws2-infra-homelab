@@ -14,7 +14,8 @@ These were written alongside the build, in the application repository, and moved
 
 - [Hardening](02-hardening.md): firewalls, auto-start and defence in depth for each machine.
 - [Ansible](06-ansible.md): how the fleet is configured and the order playbooks run in.
-- [Terraform](07-terraform.md): one-time prerequisites, the test loop versus the real fleet, and lessons from importing live machines.
+- [Terraform](07-terraform.md): one-time prerequisites, the test loop versus the real fleet, and the drift check.
+- [Terraform lessons](terraform-lessons.md): problems met provisioning and importing live machines, with fixes.
 - [Production hardening](09-production-hardening.md): deploy safety, TLS, Vault secrets and the known follow-ups.
 - [Backups](10-backups.md): coordinated cross-database backups, retention, the restore drill and alerting.
 - [CI](11-ci.md): the self-hosted GitHub Actions runner, why it was self-hosted, and a real upstream Action bug found running it.

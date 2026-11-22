@@ -13,7 +13,7 @@ This article lists the order the environment was stood up in, what each step pro
 - The Terraform state backend reachable. State lived in MinIO on `linux-mini-io`, a VM that was not always running (`qm status 109`, then `qm start 109`)
 - A Vault AppRole for Ansible. The Vault root token was never used for deploys
 
-Details for each are in [Terraform](07-terraform.md#one-time-prerequisites).
+Details for each are in [Terraform](07-terraform.md#2-one-time-prerequisites).
 
 ## 2. Provision the machines
 
@@ -43,7 +43,7 @@ ansible-playbook -i inventory-ip.yml playbooks/site.yml
 
 - `site.yml` runs the five database playbooks and `app-server.yml` in dependency order.
 - A single host can be run on its own, for example `playbooks/linux-mysql.yml`, or the whole database group with `--limit databases`.
-- Tailscale addresses change when a machine is rebuilt, so `resolve_tailscale_ips.py` regenerates the inventory ([Ansible](06-ansible.md#inventory--updating-tailscale-ips)).
+- Tailscale addresses change when a machine is rebuilt, so `resolve_tailscale_ips.py` regenerates the inventory ([Ansible](06-ansible.md#31-update-tailscale-addresses)).
 
 ## 4. Harden and verify
 
